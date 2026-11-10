@@ -316,7 +316,7 @@ def ir_to_xml(program: Program, old_format=True, use_scratch=True, pretty_print=
         if len(gpu.threadblocks) > 0:
             max_tb_channels = max(tb.channel+1 for tb in gpu.threadblocks)
         nchannels = max(nchannels, max_tb_channels)
-    # Generate the XML structure
+    if (_t := _ir_text(program, old_format, use_scratch, pretty_print, buffer_sizes, tb_id, op_tb_id, op_idx, has_dependence, nchannels)) is not None: return _t  # else: the lxml path below
     algo_elem = ET.Element('algo')
     algo_elem.set('name', program.name)
     algo_elem.set('proto', program.protocol)
@@ -393,3 +393,82 @@ def ir_to_xml(program: Program, old_format=True, use_scratch=True, pretty_print=
     if pretty_print:
         ET.indent(algo_elem, space='  ')
     return ET.tostring(algo_elem, encoding='unicode')
+
+# Text writer for ir_to_xml (speed): the characters lxml writes for this tree, or None.
+# It takes the wrapper's call form only, and only values that lxml writes unchanged: the three names match
+# _IR_PLAIN, every number is an int, every buffer a Buffer, every type an Instruction. In every other case, and on
+# any error, it returns None and ir_to_xml goes on with the lxml code, which is unchanged.
+import re as _re
+_IR_PLAIN = _re.compile(r"[A-Za-z0-9_.+-]*\Z")
+
+
+def _ir_text(program, old_format, use_scratch, pretty_print, buffer_sizes, tb_id, op_tb_id, op_idx, has_dependence, nchannels):
+    try:
+        if old_format is not True or use_scratch is not True or pretty_print is not True:
+            return None
+        for v in (program.name, program.protocol, program.collective):
+            if type(v) is not str or _IR_PLAIN.match(v) is None:
+                return None
+        if len(program.gpus) == 0:
+            return None
+        nchunks = max(max(buffer_sizes[(gpu.rank, Buffer.input)], buffer_sizes[(gpu.rank, Buffer.output)]) for gpu in program.gpus)
+        if type(nchannels) is not int or type(nchunks) is not int:
+            return None
+        out = ['<algo name="%s" proto="%s" nchannels="%d" nchunksperloop="%d" ngpus="%d" coll="%s" inplace="%d">\n' % (
+            program.name, program.protocol, nchannels, nchunks, len(program.gpus), program.collective,
+            1 if program.inplace else 0)]
+        w = out.append
+        for gpu in program.gpus:
+            ic = max(buffer_sizes[(gpu.rank, Buffer.input)], gpu.input_chunks)
+            oc = max(buffer_sizes[(gpu.rank, Buffer.output)], gpu.output_chunks)
+            sc = max(buffer_sizes[(gpu.rank, Buffer.scratch)], gpu.scratch_size())
+            if type(gpu.rank) is not int or type(ic) is not int or type(oc) is not int or type(sc) is not int:
+                return None
+            if len(gpu.threadblocks) == 0:
+                w('  <gpu id="%d" i_chunks="%d" o_chunks="%d" s_chunks="%d"/>\n' % (gpu.rank, ic, oc, sc))
+                continue
+            w('  <gpu id="%d" i_chunks="%d" o_chunks="%d" s_chunks="%d">\n' % (gpu.rank, ic, oc, sc))
+            for tb in gpu.threadblocks:
+                tid = tb_id[tb]
+                if type(tid) is not int or type(tb.send) is not int or type(tb.recv) is not int or type(tb.channel) is not int:
+                    return None
+                if len(tb.ops) == 0:
+                    w('    <tb id="%d" send="%d" recv="%d" chan="%d"/>\n' % (tid, tb.send, tb.recv, tb.channel))
+                    continue
+                w('    <tb id="%d" send="%d" recv="%d" chan="%d">\n' % (tid, tb.send, tb.recv, tb.channel))
+                for op in tb.ops:
+                    if type(op.inst) is not Instruction:
+                        return None
+                    if op.src is not None:
+                        sb, so = op.src.buffer, op.src.index
+                        if type(sb) is not Buffer or type(so) is not int:
+                            return None
+                        sb = sb.value
+                    else:
+                        sb, so = 'i', -1
+                    if op.dst is not None:
+                        db, do = op.dst.buffer, op.dst.index
+                        if type(db) is not Buffer or type(do) is not int:
+                            return None
+                        db = db.value
+                    else:
+                        db, do = 'o', -1
+                    cnt = op.cnt()
+                    nd = len(op.depends)
+                    if nd == 1:
+                        depid, deps = op_tb_id[op.depends[0]], op_idx[op.depends[0]]
+                    elif nd == 0:
+                        depid, deps = -1, -1
+                    else:
+                        return None
+                    idx = op_idx[op]
+                    if type(cnt) is not int or type(depid) is not int or type(deps) is not int or type(idx) is not int:
+                        return None
+                    w('      <step s="%d" type="%s" srcbuf="%s" srcoff="%d" dstbuf="%s" dstoff="%d" cnt="%d" depid="%d" deps="%d" hasdep="%d"/>\n' % (
+                        idx, op.inst.value, sb, so, db, do, cnt, depid, deps, 1 if op in has_dependence else 0))
+                w('    </tb>\n')
+            w('  </gpu>\n')
+        w('</algo>')
+        return ''.join(out)
+    except Exception:
+        return None

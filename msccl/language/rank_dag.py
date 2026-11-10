@@ -181,7 +181,7 @@ class InstructionDAG:
     def _complete_metadata(self):
         def dfs(op, cs):
             op.chunk_step = max(op.chunk_step, cs+1)
-
+            if getattr(op, "_md", None) == op.chunk_step: return  # nothing new since the last full visit of op
             if len(op.next) == 0 and op.recv_match is None:
                 op.priority = 0
             else:
@@ -194,7 +194,7 @@ class InstructionDAG:
                 if op.is_send():
                     dfs(op.recv_match, op.chunk_step)
                     op.priority = max(op.priority, op.recv_match.priority+1)
-
+            op._md = op.chunk_step  # the value this full visit handed to every child
         for chunk, op in self.operations.items():
             if op.inst == Instruction.start:
                 dfs(op,-2) # Start instructions should start at -1
